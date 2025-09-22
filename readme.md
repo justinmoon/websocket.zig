@@ -435,13 +435,18 @@ pub fn main() !void {
 
   // send the initial handshake request
   const request_path = "/ws";
-  try client.handshake(request_path, .{
+  var handshake = try client.handshake(request_path, .{
     .timeout_ms = 1000,
     // Raw headers to send, if any. 
     // A lot of servers require a Host header.
     // Separate multiple headers using \r\n
     .headers = "Host: localhost:9224",
   });
+  defer handshake.deinit();
+
+  if (handshake.get("sec-websocket-protocol")) |protocol| {
+    std.debug.print("negotiated subprotocol: {s}\n", .{protocol});
+  }
 }
 ```
 
@@ -495,10 +500,13 @@ Setting `max_size == buffer_size` is valid and will ensure that no dynamic memor
 Zig only supports TLS 1.3, so this library can only connect to hosts using TLS 1.3. If no `ca_bundle` is provided, the library will create a default bundle per connection.
 
 ### Handshake
-`client.handshake()` takes two parameters. The first is the request path. The second is handshake configuration value:
+`client.handshake()` returns a `Client.HandshakeResult` and takes two parameters. The first is the request path. The second is the handshake configuration value. Remember to call `result.deinit()` once you're done inspecting the negotiated headers.
 
 * `timeout_ms` - Timeout, in milliseconds, for the handshake. Default: `10_000` (10 seconds).
 * `headers` - Raw headers to include in the handshake. Multiple headers should be separated by by "\r\n". Many servers require a Host header. Example: `"Host: server\r\nAuthorization: Something"`. Defaul: `null`
+* `expected_subprotocol` - Optional subprotocol value to require. If the server omits `Sec-WebSocket-Protocol` or returns a different value the handshake fails.
+
+`HandshakeResult.get(name)` returns the first negotiated response header (names are stored lowercase for easy comparison), while `headersSlice()` exposes every header/value pair.
 
 ### Custom Wrapper
 In more advanced cases, you'll likely want to wrap a `*ws.Client` in your own type and use a background read loop with "callback" methods. Like in the above example, you'll first want to create a client and initialize a handshake:
@@ -518,10 +526,11 @@ const Handler = struct {
 
      // send the initial handshake request
     const request_path = "/ws";
-    try client.handshake(request_path, .{
+    var handshake = try client.handshake(request_path, .{
       .timeout_ms = 1000,
       .headers = "host: localhost:9224\r\n",
     });
+    defer handshake.deinit();
 
     return .{
       .client = client,

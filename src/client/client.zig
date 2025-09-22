@@ -68,6 +68,40 @@ pub const Client = struct {
     pub const HandshakeOpts = struct {
         timeout_ms: u32 = 10000,
         headers: ?[]const u8 = null,
+        expected_subprotocol: ?[]const u8 = null,
+    };
+
+    pub const HandshakeHeader = struct {
+        name: []const u8,
+        value: []const u8,
+    };
+
+    pub const HandshakeResult = struct {
+        compression: bool,
+        headers: std.ArrayListUnmanaged(HandshakeHeader),
+        allocator: Allocator,
+
+        pub fn deinit(self: HandshakeResult) void {
+            var headers = self.headers;
+            for (headers.items) |header| {
+                self.allocator.free(header.name);
+                self.allocator.free(header.value);
+            }
+            headers.deinit(self.allocator);
+        }
+
+        pub fn get(self: HandshakeResult, needle: []const u8) ?[]const u8 {
+            for (self.headers.items) |header| {
+                if (std.mem.eql(u8, header.name, needle)) {
+                    return header.value;
+                }
+            }
+            return null;
+        }
+
+        pub fn headersSlice(self: HandshakeResult) []const HandshakeHeader {
+            return self.headers.items;
+        }
     };
 
     const Compression = struct {
@@ -143,9 +177,11 @@ pub const Client = struct {
         }
     }
 
-    pub fn handshake(self: *Client, path: []const u8, opts: HandshakeOpts) !void {
+    pub fn handshake(self: *Client, path: []const u8, opts: HandshakeOpts) !HandshakeResult {
         const stream = &self.stream;
         errdefer self.closeStream();
+
+        const handshake_allocator = self._reader.large_buffer_provider.allocator;
 
         // we've already setup our reader, and the reader has a static buffer
         // we might as well use it!
@@ -158,8 +194,28 @@ pub const Client = struct {
 
         try sendHandshake(path, key, buf, &opts, self._compression_opts != null, stream);
 
-        const res = try HandShakeReply.read(buf, key, &opts, self._compression_opts != null, stream);
+        var res = try HandShakeReply.read(buf, key, &opts, self._compression_opts != null, stream, handshake_allocator);
+        errdefer res.deinit(handshake_allocator);
         errdefer self.close(.{ .code = 1001 }) catch unreachable;
+
+        if (opts.expected_subprotocol) |expected_subprotocol| {
+            const negotiated = blk: {
+                for (res.headers.items) |header| {
+                    if (std.mem.eql(u8, header.name, "sec-websocket-protocol")) {
+                        break :blk header.value;
+                    }
+                }
+                break :blk null;
+            };
+
+            if (negotiated) |value| {
+                if (!std.mem.eql(u8, value, expected_subprotocol)) {
+                    return error.UnexpectedSubprotocol;
+                }
+            } else {
+                return error.ExpectedSubprotocolMissing;
+            }
+        }
 
         // Set up compression with agreed-on parameters
         if (res.compression) {
@@ -170,6 +226,16 @@ pub const Client = struct {
         // has positioned the extra data at the start of the buffer, but we need
         // to set the length.
         self._reader.pos = res.over_read;
+
+        const result = HandshakeResult{
+            .compression = res.compression,
+            .headers = res.headers,
+            .allocator = handshake_allocator,
+        };
+        // Ownership of header allocations moves into the result; prevent the
+        // errdefer from freeing them now that we're returning success.
+        res.headers = std.ArrayListUnmanaged(HandshakeHeader){};
+        return result;
     }
 
     fn setupCompression(self: *Client) !void {
@@ -616,8 +682,17 @@ fn sendHandshake(path: []const u8, key: []const u8, buf: []u8, opts: *const Clie
 const HandShakeReply = struct {
     compression: bool,
     over_read: usize,
+    headers: std.ArrayListUnmanaged(Client.HandshakeHeader),
 
-    fn read(buf: []u8, key: []const u8, opts: *const Client.HandshakeOpts, compression: bool, stream: anytype) !HandShakeReply {
+    fn deinit(self: *HandShakeReply, allocator: Allocator) void {
+        for (self.headers.items) |header| {
+            allocator.free(header.name);
+            allocator.free(header.value);
+        }
+        self.headers.deinit(allocator);
+    }
+
+    fn read(buf: []u8, key: []const u8, opts: *const Client.HandshakeOpts, compression: bool, stream: anytype, allocator: Allocator) !HandShakeReply {
         const timeout_ms = opts.timeout_ms;
         const deadline = std.time.milliTimestamp() + timeout_ms;
         try stream.readTimeout(timeout_ms);
@@ -626,6 +701,14 @@ const HandShakeReply = struct {
         var line_start: usize = 0;
         var complete_response: u8 = 0;
         var server_compression: bool = false;
+        var headers = std.ArrayListUnmanaged(Client.HandshakeHeader){};
+        errdefer {
+            for (headers.items) |header| {
+                allocator.free(header.name);
+                allocator.free(header.value);
+            }
+            headers.deinit(allocator);
+        }
 
         while (true) {
             const n = stream.read(buf[pos..]) catch |err| switch (err) {
@@ -648,6 +731,7 @@ const HandShakeReply = struct {
                     return .{
                         .over_read = over_read,
                         .compression = server_compression,
+                        .headers = headers,
                     };
                 }
 
@@ -665,6 +749,7 @@ const HandShakeReply = struct {
                     continue;
                 }
 
+                var colon_index: ?usize = null;
                 for (line, 0..) |b, i| {
                     // find the colon and lowercase the header while we're iterating
                     if ('A' <= b and b <= 'Z') {
@@ -672,59 +757,59 @@ const HandShakeReply = struct {
                         continue;
                     }
 
-                    if (b != ':') {
-                        continue;
-                    }
-
-                    switch (i) {
-                        7 => if (std.mem.eql(u8, line[0..i], "upgrade")) {
-                            if (!ascii.eqlIgnoreCase(std.mem.trim(u8, line[i + 1 ..], &ascii.whitespace), "websocket")) {
-                                return error.InvalidUpgradeHeader;
-                            }
-                            complete_response |= 2;
-                        },
-                        10 => if (std.mem.eql(u8, line[0..i], "connection")) {
-                            if (!ascii.eqlIgnoreCase(std.mem.trim(u8, line[i + 1 ..], &ascii.whitespace), "upgrade")) {
-                                return error.InvalidConnectionHeader;
-                            }
-                            complete_response |= 4;
-                        },
-                        20 => if (std.mem.eql(u8, line[0..i], "sec-websocket-accept")) {
-                            var h: [20]u8 = undefined;
-                            {
-                                var hasher = std.crypto.hash.Sha1.init(.{});
-                                hasher.update(key);
-                                hasher.update("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
-                                hasher.final(&h);
-                            }
-
-                            var encoded_buf: [28]u8 = undefined;
-                            const sec_hash = std.base64.standard.Encoder.encode(&encoded_buf, &h);
-                            const header_value = std.mem.trim(u8, line[i + 1 ..], &ascii.whitespace);
-
-                            if (!std.mem.eql(u8, header_value, sec_hash)) {
-                                return error.InvalidWebsocketAcceptHeader;
-                            }
-                            complete_response |= 8;
-                        },
-                        24 => if (std.mem.eql(u8, line[0..i], "sec-websocket-extensions")) {
-                            if (try parseExtension(line[i + 1 ..])) |sc| {
-                                if (!compression) {
-                                    // server is saying compression, but we didn't ask for it.
-                                    return error.InvalidExtensionHeader;
-                                }
-                                if (!sc.client_no_context_takeover or !sc.server_no_context_takeover) {
-                                    // as of Zig 0.15, we no longer support context takeover
-                                    // We told the server this, it should have respected it.
-                                    return error.InvalidExtensionHeader;
-                                }
-
-                                server_compression = true;
-                            }
-                        },
-                        else => {}, // some other header we don't care about
+                    if (b == ':') {
+                        colon_index = i;
+                        break;
                     }
                 }
+
+                const idx = colon_index orelse continue;
+                const header_name = line[0..idx];
+                const header_value = std.mem.trim(u8, line[idx + 1 ..], &ascii.whitespace);
+
+                if (std.mem.eql(u8, header_name, "upgrade")) {
+                    if (!ascii.eqlIgnoreCase(header_value, "websocket")) {
+                        return error.InvalidUpgradeHeader;
+                    }
+                    complete_response |= 2;
+                } else if (std.mem.eql(u8, header_name, "connection")) {
+                    if (!ascii.eqlIgnoreCase(header_value, "upgrade")) {
+                        return error.InvalidConnectionHeader;
+                    }
+                    complete_response |= 4;
+                } else if (std.mem.eql(u8, header_name, "sec-websocket-accept")) {
+                    var h: [20]u8 = undefined;
+                    {
+                        var hasher = std.crypto.hash.Sha1.init(.{});
+                        hasher.update(key);
+                        hasher.update("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+                        hasher.final(&h);
+                    }
+
+                    var encoded_buf: [28]u8 = undefined;
+                    const sec_hash = std.base64.standard.Encoder.encode(&encoded_buf, &h);
+
+                    if (!std.mem.eql(u8, header_value, sec_hash)) {
+                        return error.InvalidWebsocketAcceptHeader;
+                    }
+                    complete_response |= 8;
+                } else if (std.mem.eql(u8, header_name, "sec-websocket-extensions")) {
+                    if (try parseExtension(line[idx + 1 ..])) |sc| {
+                        if (!compression) {
+                            // server is saying compression, but we didn't ask for it.
+                            return error.InvalidExtensionHeader;
+                        }
+                        if (!sc.client_no_context_takeover or !sc.server_no_context_takeover) {
+                            // as of Zig 0.15, we no longer support context takeover
+                            // We told the server this, it should have respected it.
+                            return error.InvalidExtensionHeader;
+                        }
+
+                        server_compression = true;
+                    }
+                }
+
+                try HandShakeReply.appendHeader(&headers, allocator, header_name, header_value);
             }
 
             if (std.time.milliTimestamp() > deadline) {
@@ -778,6 +863,19 @@ const HandShakeReply = struct {
             .client_no_context_takeover = client_no_context_takeover,
             .server_no_context_takeover = server_no_context_takeover,
         };
+    }
+
+    fn appendHeader(
+        headers: *std.ArrayListUnmanaged(Client.HandshakeHeader),
+        allocator: Allocator,
+        name: []const u8,
+        value: []const u8,
+    ) !void {
+        const name_copy = try allocator.dupe(u8, name);
+        errdefer allocator.free(name_copy);
+        const value_copy = try allocator.dupe(u8, value);
+        errdefer allocator.free(value_copy);
+        try headers.append(allocator, .{ .name = name_copy, .value = value_copy });
     }
 };
 
@@ -879,7 +977,10 @@ test "Client: handshake" {
 
         var client = testClient(pair.server);
         defer client.deinit();
-        try client.handshake("/", .{});
+        var handshake_result = try client.handshake("/", .{});
+        defer handshake_result.deinit();
+        const accept = handshake_result.get("sec-websocket-accept") orelse return error.TestExpectedEqual;
+        try t.expectString("C/0nmHhBztSRGR1CwL6Tf4ZjwpY=", accept);
         try t.expectEqual(0, client._reader.pos);
     }
 
@@ -891,8 +992,52 @@ test "Client: handshake" {
 
         var client = testClient(pair.server);
         defer client.deinit();
-        try client.handshake("/", .{});
+        var handshake_result = try client.handshake("/", .{});
+        defer handshake_result.deinit();
+        const accept = handshake_result.get("sec-websocket-accept") orelse return error.TestExpectedEqual;
+        try t.expectString("C/0nmHhBztSRGR1CwL6Tf4ZjwpY=", accept);
         try t.expectEqual(50, client._reader.pos);
+    }
+
+    {
+        // expected subprotocol present and correct
+        var pair = t.SocketPair.init(.{});
+        defer pair.deinit();
+        try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Protocol: mosaic2025\r\nSec-Websocket-Accept: C/0nmHhBztSRGR1CwL6Tf4ZjwpY=\r\n\r\n");
+
+        var client = testClient(pair.server);
+        defer client.deinit();
+        var handshake_result = try client.handshake("/", .{
+            .expected_subprotocol = "mosaic2025",
+        });
+        defer handshake_result.deinit();
+        try t.expectEqual(0, client._reader.pos);
+    }
+
+    {
+        // expected subprotocol missing
+        var pair = t.SocketPair.init(.{});
+        defer pair.deinit();
+        try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Accept: C/0nmHhBztSRGR1CwL6Tf4ZjwpY=\r\n\r\n");
+
+        var client = testClient(pair.server);
+        defer client.deinit();
+        try t.expectError(error.ExpectedSubprotocolMissing, client.handshake("/", .{
+            .expected_subprotocol = "mosaic2025",
+        }));
+    }
+
+    {
+        // expected subprotocol mismatch
+        var pair = t.SocketPair.init(.{});
+        defer pair.deinit();
+        try pair.client.writeAll("HTTP/1.1 101 Switching Protocol\r\nupgrade: WebSocket\r\nConnection: UPGRADE\r\nSec-Websocket-Protocol: nostril\r\nSec-Websocket-Accept: C/0nmHhBztSRGR1CwL6Tf4ZjwpY=\r\n\r\n");
+
+        var client = testClient(pair.server);
+        defer client.deinit();
+        try t.expectError(error.UnexpectedSubprotocol, client.handshake("/", .{
+            .expected_subprotocol = "mosaic2025",
+        }));
     }
 }
 
@@ -903,9 +1048,10 @@ test "Client: write/read" {
     });
     defer client.deinit();
 
-    try client.handshake("/", .{
+    var handshake_result = try client.handshake("/", .{
         .timeout_ms = 1000,
     });
+    defer handshake_result.deinit();
 
     var buf = [_]u8{ 'o', 'v', 'e', 'r' };
     try client.write(&buf);
@@ -925,9 +1071,10 @@ test "Client: close with code" {
     });
     defer client.deinit();
 
-    try client.handshake("/", .{
+    var handshake_result = try client.handshake("/", .{
         .timeout_ms = 1000,
     });
+    defer handshake_result.deinit();
 
     client.close(.{ .code = 4002 }) catch unreachable;
 }
@@ -939,9 +1086,10 @@ test "Client: with code and reason" {
     });
     defer client.deinit();
 
-    try client.handshake("/", .{
+    var handshake_result = try client.handshake("/", .{
         .timeout_ms = 1000,
     });
+    defer handshake_result.deinit();
 
     client.close(.{ .code = 4002, .reason = "goodbye" }) catch unreachable;
 }
@@ -1009,9 +1157,10 @@ const ClientHandler = struct {
         });
         errdefer client.deinit();
 
-        try client.handshake("/", .{
+        var handshake_result = try client.handshake("/", .{
             .timeout_ms = 1000,
         });
+        defer handshake_result.deinit();
 
         return .{
             .client = client,

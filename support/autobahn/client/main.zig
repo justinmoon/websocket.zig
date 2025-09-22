@@ -74,9 +74,10 @@ fn updateReport(allocator: std.mem.Allocator) !void {
     });
 
     defer client.deinit();
-    try client.handshake("/updateReports?agent=websocket.zig", .{
+    var handshake_result = try client.handshake("/updateReports?agent=websocket.zig", .{
         .headers = "host: localhost:9001\r\n",
     });
+    defer handshake_result.deinit();
 
     client.close(.{}) catch unreachable;
 }
@@ -98,10 +99,11 @@ const Handler = struct {
             // },
         });
         errdefer client.deinit();
-        try client.handshake(path, .{
+        var handshake_result = try client.handshake(path, .{
             .timeout_ms = 5000,
             .headers = "host: localhost:9001\r\n",
         });
+        defer handshake_result.deinit();
 
         return .{
             .client = client,
